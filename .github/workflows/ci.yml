@@ -28,15 +28,10 @@ jobs:
           cache: pip
 
       - name: Install dependencies
+        # Тот же requirements.txt, из которого собирается прод-образ.
         run: |
           python -m pip install --upgrade pip
-          # pdfplumber и python-docx нужны для чтения тестовых контрактов;
-          # запись фикстур вынесена в scripts/make_test_fixtures.py и в CI не выполняется
-          pip install fastapi==0.115.6 pydantic==2.10.4 pydantic-settings==2.7.0 \
-            httpx==0.28.1 python-dotenv==1.0.1 PyYAML==6.0.2 \
-            pdfplumber==0.11.4 python-docx==1.2.0 python-multipart==0.0.20 \
-            reportlab==5.0.1
-          pip install -r requirements-dev.txt
+          pip install -r requirements.txt -r requirements-dev.txt
 
       - name: Ruff check
         run: ruff check app tests scripts --select E,F --ignore E501
@@ -45,3 +40,66 @@ jobs:
         env:
           PYTHONPATH: .
         run: pytest -q
+
+      - name: Матрица правил на образцах
+        env:
+          PYTHONPATH: .
+        run: python -m scripts.eval_fixtures
+
+      - name: Приёмочный прогон разбора оговорок (запись, модель не нужна)
+        env:
+          PYTHONPATH: .
+        run: |
+          python -m scripts.eval_llm \
+            --replay data/eval/llm_runs/synthetic_full_extraction.json --no-gate
+
+  docker:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Собрать образ
+        run: docker build -t complegge-ai:ci .
+
+      - name: Поднять и опросить /health
+        # Ollama в CI нет: сервис обязан подняться и честно сказать "ollama: off".
+        run: |
+          docker run -d --name complegge -p 8000:8000 complegge-ai:ci
+          for attempt in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:8000/health > /tmp/health.json; then break; fi
+            sleep 2
+          done
+          cat /tmp/health.json
+          python - <<'PY'
+          import json
+          health = json.load(open("/tmp/health.json"))
+          assert health["status"] == "ok", health
+          assert health["ollama"] == "off", "в CI модели нет, ответ должен быть честным"
+          assert health["model"]["tier"], health
+          print("health ok:", health["version"], health["model"]["label"])
+          PY
+
+      - name: Проверка договора через HTTP без модели
+        run: |
+          curl -fsS -F file=@tests/fixtures/contract_violating.docx \
+            "http://127.0.0.1:8000/check?on=2026-09-01" > /tmp/check.json
+          python - <<'PY'
+          import json
+          report = json.load(open("/tmp/check.json"))
+          assert report["status"] == "red", report["status"]
+          assert report["counts"]["blocking"] > 0, report["counts"]
+          assert report["llm"]["available"] is False
+          print("проверка без модели:", report["status"], report["counts"])
+          PY
+
+      - name: PDF-заключение через HTTP
+        run: |
+          curl -fsS -o /tmp/zaklyuchenie.pdf -F file=@tests/fixtures/contract_compliant.pdf \
+            "http://127.0.0.1:8000/check/pdf?on=2026-09-01"
+          head -c 4 /tmp/zaklyuchenie.pdf | grep -q '%PDF'
+          test "$(stat -c%s /tmp/zaklyuchenie.pdf)" -gt 10000
+
+      - name: Журнал контейнера
+        if: always()
+        run: docker logs complegge || true

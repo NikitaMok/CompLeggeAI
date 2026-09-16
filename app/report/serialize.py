@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from app.llm.clauses import ClauseAnalysis
 from app.norms.index import NormIndex, get_norms
+from app.report.analysis import assess_party, assess_wallet
 from app.rules.engine import ContractStatus, Finding, FindingStatus, Report
 
 STATUS_LABEL = {
@@ -95,6 +96,15 @@ def serialize_report(
         quoted = quote_norms_for(finding, index) if with_quotes and index else None
         return finding_to_dict(finding, quoted=quoted)
 
+    wallets = [
+        item.to_dict() if hasattr(item, "to_dict") else item
+        for item in (address_scores or [])
+    ]
+    parties = [
+        item.to_dict() if hasattr(item, "to_dict") else item
+        for item in (counterparties or [])
+    ]
+
     payload = {
         "status": report.status.value,
         "status_label": STATUS_LABEL[report.status],
@@ -112,14 +122,12 @@ def serialize_report(
             if finding.status is FindingStatus.DEFERRED
         ],
         "manual": [_dump(finding, with_quotes=False) for finding in report.needs_manual_review()],
-        "address_scores": [
-            item.to_dict() if hasattr(item, "to_dict") else item
-            for item in (address_scores or [])
-        ],
-        "counterparties": [
-            item.to_dict() if hasattr(item, "to_dict") else item
-            for item in (counterparties or [])
-        ],
+        "address_scores": wallets,
+        "counterparties": parties,
+        # Разбор тот же, что печатается в PDF: страница и заключение
+        # не должны расходиться в выводах.
+        "wallet_analysis": [assess_wallet(item).to_dict() for item in wallets],
+        "party_analysis": [assess_party(item).to_dict() for item in parties],
         "llm": llm.to_dict() if llm is not None else None,
     }
     return payload

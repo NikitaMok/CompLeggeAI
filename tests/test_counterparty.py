@@ -102,6 +102,21 @@ class TestEgrulMock:
             assert "сверка не выполнена" in hit.detail or "капч" in hit.detail.lower()
 
 
+@pytest.fixture
+def opencorporates_token(monkeypatch):
+    """OpenCorporates без токена отвечает 401, поэтому запрос не отправляется.
+
+    Разбор его ответа проверяется с заданным токеном.
+    """
+    from app.core.config import get_settings
+
+    settings = get_settings()
+    saved = settings.opencorporates_api_token
+    settings.opencorporates_api_token = "test-token"
+    yield
+    settings.opencorporates_api_token = saved
+
+
 class TestForeignLookup:
     def test_russian_inn_does_not_query_foreign_registries(self):
         seen: list[str] = []
@@ -121,7 +136,7 @@ class TestForeignLookup:
 
         assert not any("opencorporates" in host or "gleif" in host for host in seen)
 
-    def test_name_match_is_found(self):
+    def test_name_match_is_found(self, opencorporates_token):
         def handler(request: httpx.Request) -> httpx.Response:
             host = request.url.host or ""
             if "opencorporates.com" in host:
@@ -162,7 +177,7 @@ class TestForeignLookup:
         assert oc.name_match is True
         assert oc.jurisdiction == "cn"
 
-    def test_http_error_is_not_success(self):
+    def test_http_error_is_not_success(self, opencorporates_token):
         def handler(request: httpx.Request) -> httpx.Response:
             return httpx.Response(503, text="offline")
 

@@ -113,7 +113,14 @@ def print_clause_notes(llm) -> None:
     print(f"\nОГОВОРКИ, КОТОРЫЕ ФОРМАЛЬНАЯ ПРОВЕРКА НЕ ЛОВИТ\n{RULE}")
     print(payload.get("detail") or "")
     if payload.get("model"):
-        print(f"    модель: {payload['model']}")
+        tier = payload.get("tier") or {}
+        suffix = f" ({tier['label']})" if tier.get("label") else ""
+        print(f"    модель: {payload['model']}{suffix}")
+        if tier.get("note") and tier.get("tier") in ("limited", "unsupported", "unknown"):
+            print(_wrap(tier["note"]))
+    coverage = payload.get("coverage") or {}
+    if payload.get("available") and coverage.get("summary"):
+        print(_wrap("покрытие: " + coverage["summary"]))
     for note in payload.get("notes") or []:
         present = note.get("present")
         mark = "есть в тексте" if present else "в тексте не видно" if present is False else "не ясно"
@@ -126,7 +133,7 @@ def print_clause_notes(llm) -> None:
 
 
 def print_counterparties(parties: list) -> None:
-    print(f"\nКОНТРАГЕНТ\n{RULE}")
+    print(f"\nЛИЦА, НАЗВАННЫЕ В ДОГОВОРЕ\n{RULE}")
     if not parties:
         print("сверка не выполнена")
         print()
@@ -134,7 +141,8 @@ def print_counterparties(parties: list) -> None:
     for item in parties:
         payload = item.to_dict() if hasattr(item, "to_dict") else item
         who = payload.get("name") or payload.get("inn") or "сторона не названа"
-        print(who)
+        role = payload.get("role")
+        print(f"{who} — {role}" if role else who)
         if payload.get("inn"):
             print(f"    ИНН {payload['inn']}")
         if payload.get("foreign"):

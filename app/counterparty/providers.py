@@ -1,9 +1,18 @@
 """Коннекторы сверки контрагента.
 
-Российская сторона (есть ИНН): ЕГРЮЛ ФНС, rusprofile.ru, saby.ru.
-Иностранная сторона (нет российского ИНН): OpenCorporates и GLEIF, без ключа.
-Платный коннектор включается записью `enabled: true` в config/providers.yaml
-и ключом в `.env`. Пока HTTP-клиента нет — в отчёте «сверка не выполнена».
+Российская сторона (есть ИНН): сначала DaData и Контур.Фокус — они дают
+правовой статус полем и подключаются ключом клиента (`app/counterparty/ru.py`).
+Публичные страницы ЕГРЮЛ, rusprofile.ru и saby.ru остаются запасным
+вариантом на случай, когда ключей нет: они подтверждают существование
+карточки, но не правовой статус.
+
+Иностранная сторона: GLEIF без ключа, OpenCorporates по бесплатному токену
+(на живом прогоне 15.09.2026 без токена отвечает 401).
+
+Любая сторона дополнительно проходит санкционный и PEP-скрининг
+(`app/counterparty/sanctions.py`).
+
+Наружу уходят ИНН и наименование, не текст договора.
 """
 
 from __future__ import annotations
@@ -12,13 +21,21 @@ import re
 
 import httpx
 
+from app import __version__
+from app.core import provider
 from app.core.catalog import load_catalog
+from app.core.net import source_unavailable
+from app.counterparty import ru, sanctions
 from app.counterparty.models import SourceHit, names_match, skipped
 from app.rules.guardrail import assert_clean
 
-_TIMEOUT = httpx.Timeout(8.0, connect=4.0)
+# ЕГРЮЛ отвечает медленно: на живом прогоне 15.09.2026 он не уложился в 8 с.
+# Читаем дольше, соединение устанавливаем по-прежнему быстро.
+_READ_TIMEOUT_S = 20.0
+_CONNECT_TIMEOUT_S = 5.0
+_TIMEOUT = httpx.Timeout(_READ_TIMEOUT_S, connect=_CONNECT_TIMEOUT_S)
 _HEADERS = {
-    "User-Agent": "LexCryptoAI/0.6 (local contract check)",
+    "User-Agent": f"CompLeggeAI/{__version__} (local contract check)",
     "Accept": "application/json, text/html;q=0.8",
 }
 
@@ -54,6 +71,7 @@ def lookup_free_sources(
     client: httpx.Client | None = None,
     *,
     foreign: bool = False,
+    country: str | None = None,
 ) -> tuple[SourceHit, ...]:
     catalog = load_catalog()
     hits: list[SourceHit] = []
@@ -64,6 +82,7 @@ def lookup_free_sources(
             hits.extend(_lookup_foreign(name, session, catalog))
         else:
             hits.extend(_lookup_russian(inn, name, session, catalog))
+        hits.extend(_screen(name, session, foreign=foreign, country=country))
     finally:
         if own:
             session.close()
@@ -71,16 +90,36 @@ def lookup_free_sources(
     return tuple(hits)
 
 
+def _screen(
+    name: str, session: httpx.Client, *, foreign: bool, country: str | None = None
+) -> list[SourceHit]:
+    """Санкционный и PEP-скрининг: он одинаково нужен обеим сторонам."""
+    if provider.status_of("sanctions", sanctions.SOURCE_ID).value == "disabled":
+        return []
+    return [sanctions.screen(name, session, foreign=foreign, country=country)]
+
+
 def _lookup_russian(inn: str | None, name: str, session: httpx.Client, catalog) -> list[SourceHit]:
-    hits: list[SourceHit] = []
-    if catalog.uses("counterparty", "egrul"):
-        hits.append(_egrul(inn, name, session) if inn else skipped("egrul", "нет ИНН"))
-    if catalog.uses("counterparty", "rusprofile"):
-        hits.append(
-            _rusprofile(inn, name, session) if inn else skipped("rusprofile", "нет ИНН")
-        )
-    if catalog.uses("counterparty", "saby"):
-        hits.append(_saby(inn, name, session) if inn else skipped("saby", "нет ИНН"))
+    if not inn:
+        # Без ИНН российские карточки не ищутся ни по одному источнику, и об
+        # этом уже сказано в итоговой строке по стороне. Раньше каждый источник
+        # писал сюда своё «нет ИНН», и юрист читал три одинаковых сообщения.
+        return []
+
+    # Ключевые источники: правовой статус приходит полем, а не поиском слова
+    # в HTML. Если хотя бы один отработал, публичные страницы не опрашиваем —
+    # они добавят к заключению только строку «карточка существует».
+    hits: list[SourceHit] = ru.lookup(inn, name, session)
+    if any(hit.performed for hit in hits):
+        return hits
+
+    for source_id, fetch in (
+        ("egrul", _egrul),
+        ("rusprofile", _rusprofile),
+        ("saby", _saby),
+    ):
+        if catalog.uses("counterparty", source_id):
+            hits.append(fetch(inn, name, session))
     return hits
 
 
@@ -101,16 +140,16 @@ def _lookup_foreign(name: str, session: httpx.Client, catalog) -> list[SourceHit
 
 
 def paid_party_notes() -> tuple[SourceHit, ...]:
-    catalog = load_catalog()
-    notes: list[SourceHit] = []
-    for source in catalog.enabled("counterparty", tier="paid"):
-        if catalog.secret(source):
-            notes.append(
-                skipped(source.id, "коннектор не реализован, сверка не выполнена")
-            )
-        else:
-            notes.append(skipped(source.id, "ключ не задан, сверка не выполнена"))
-    return tuple(notes)
+    """Источники, включённые в каталоге, но не отработавшие по устройству.
+
+    Источник без ключа докладывает о себе сам — он знает, где взять ключ.
+    Здесь остаётся один случай: запись включена, а коннектора к ней нет.
+    """
+    return tuple(
+        skipped(item.id, item.detail)
+        for item in provider.blocked("counterparty")
+        if item.status is provider.ProviderStatus.NOT_IMPLEMENTED
+    )
 
 
 def _egrul(inn: str, name: str, session: httpx.Client) -> SourceHit:
@@ -165,28 +204,39 @@ def _egrul(inn: str, name: str, session: httpx.Client) -> SourceHit:
             name_match=match,
             detail=detail,
         )
+    except httpx.ConnectTimeout:
+        return skipped(
+            "egrul",
+            f"ЕГРЮЛ: соединение не установилось за {_CONNECT_TIMEOUT_S:.0f} с, "
+            "сверка не выполнена",
+        )
     except httpx.TimeoutException:
-        return skipped("egrul", "таймаут запроса, сверка не выполнена")
+        return skipped(
+            "egrul",
+            f"ЕГРЮЛ не ответил за {_READ_TIMEOUT_S:.0f} с, сверка не выполнена",
+        )
     except httpx.HTTPStatusError as error:
         return skipped(
             "egrul",
             f"ЕГРЮЛ ответил отказом (HTTP {error.response.status_code}), сверка не выполнена",
         )
     except httpx.HTTPError as error:
-        return skipped("egrul", f"ЕГРЮЛ недоступен: {error.__class__.__name__}")
+        return skipped("egrul", source_unavailable("ЕГРЮЛ", error))
     except ValueError:
         return skipped("egrul", "ЕГРЮЛ вернул неразборчивый ответ")
 
 
-def _html_status(html: str) -> str | None:
-    lowered = html.lower()
-    if "ликвидир" in lowered:
-        return "ликвидирована"
-    if "исключен" in lowered or "исключён" in lowered:
-        return "исключена из реестра"
-    if "действующ" in lowered:
-        return "действует"
-    return None
+# Признаки организационно-правовой формы в наименовании. Нужны, чтобы отличить
+# карточку организации от служебного заголовка сайта.
+_LEGAL_FORM = re.compile(
+    r"\b(ООО|АО|ПАО|ЗАО|ОАО|НАО|ИП|ГУП|МУП|ФГУП|АНО|НКО|Фонд|Ассоциация)\b",
+    re.IGNORECASE,
+)
+
+HTML_SOURCE_LIMITS = (
+    "карточка по ИНН открылась; правовой статус по ней не определяется, "
+    "проверьте в ЕГРЮЛ"
+)
 
 
 def _html_title(html: str) -> str:
@@ -199,6 +249,17 @@ def _html_title(html: str) -> str:
 
 
 def _page_hit(source_id: str, inn: str, name: str, html: str) -> SourceHit:
+    """Что можно утверждать по HTML-карточке агрегатора.
+
+    Правовой статус поиском слова по всей странице определять нельзя.
+    На прогоне 15.09.2026 карточка Сбербанка на saby.ru дала «ликвидирована»:
+    слово стоит в стороннем блоке разметки — в списке связанных организаций.
+    В заключение уходило «по реестру организация ликвидирована» про
+    действующий банк.
+
+    Поэтому от страницы берётся одно утверждение: карточка по этому ИНН
+    открылась. Правовой статус даёт только ЕГРЮЛ, структурированным ответом.
+    """
     if inn not in html:
         detail = f"{source_id}: страница не содержит запрошенный ИНН"
         assert_clean(detail)
@@ -209,24 +270,32 @@ def _page_hit(source_id: str, inn: str, name: str, html: str) -> SourceHit:
             inn=inn,
             detail=detail,
         )
+
     title = " ".join(_html_title(html).split())
-    legal = title.split("—")[0].split("|")[0].strip() if title else None
-    status = _html_status(html)
+    candidate = title.split("—")[0].split("|")[0].strip() if title else ""
+    # Наименование принимаем, только если оно похоже на наименование
+    # организации: есть форма собственности либо оно совпало с запрошенным.
+    plausible = bool(candidate) and (
+        bool(_LEGAL_FORM.search(candidate))
+        or (bool(name) and names_match(name, candidate))
+    )
+    legal = candidate if plausible else None
     match = names_match(name, legal) if name and legal else None
+
     bits = [source_id]
     if legal:
         bits.append(legal)
-    if status:
-        bits.append(status)
-    detail = ": ".join(bits) if len(bits) > 1 else f"{source_id}: страница открыта"
+    detail = ": ".join(bits) if len(bits) > 1 else f"{source_id}: карточка по ИНН открыта"
+    detail = f"{detail}. {HTML_SOURCE_LIMITS}"
     assert_clean(detail)
     return SourceHit(
         source_id=source_id,
         performed=True,
         found=True,
-        legal_name=legal or None,
+        legal_name=legal,
         inn=inn,
-        status=status,
+        # status не заполняется сознательно: см. докстроку
+        status=None,
         name_match=match,
         detail=detail,
     )
@@ -239,15 +308,33 @@ def _rusprofile(inn: str, name: str, session: httpx.Client) -> SourceHit:
         if _blocked_page(response.text, inn):
             return skipped("rusprofile", "Rusprofile вернул капчу или заглушку, сверка не выполнена")
         return _page_hit("rusprofile", inn, name, response.text)
-    except httpx.TimeoutException:
-        return skipped("rusprofile", "таймаут запроса, сверка не выполнена")
-    except httpx.HTTPStatusError as error:
+    except httpx.ConnectTimeout:
         return skipped(
             "rusprofile",
-            f"Rusprofile ответил отказом (HTTP {error.response.status_code}), сверка не выполнена",
+            f"Rusprofile: соединение не установилось за {_CONNECT_TIMEOUT_S:.0f} с, "
+            "сверка не выполнена",
+        )
+    except httpx.TimeoutException:
+        return skipped(
+            "rusprofile",
+            f"Rusprofile не ответил за {_READ_TIMEOUT_S:.0f} с, сверка не выполнена",
+        )
+    except httpx.HTTPStatusError as error:
+        code = error.response.status_code
+        if code == 404:
+            # 404 на поиске — это не «организации нет», это «нет такого адреса».
+            # Выдавать это за отсутствие записи нельзя.
+            return skipped(
+                "rusprofile",
+                "Rusprofile вернул 404 на адрес поиска: сверка не выполнена. "
+                "Похоже, адрес поиска на сайте изменился",
+            )
+        return skipped(
+            "rusprofile",
+            f"Rusprofile ответил отказом (HTTP {code}), сверка не выполнена",
         )
     except httpx.HTTPError as error:
-        return skipped("rusprofile", f"Rusprofile недоступен: {error.__class__.__name__}")
+        return skipped("rusprofile", source_unavailable("Rusprofile", error))
 
 
 def _saby(inn: str, name: str, session: httpx.Client) -> SourceHit:
@@ -257,24 +344,41 @@ def _saby(inn: str, name: str, session: httpx.Client) -> SourceHit:
         if _blocked_page(response.text, inn):
             return skipped("saby", "СБИС вернул капчу или заглушку, сверка не выполнена")
         return _page_hit("saby", inn, name, response.text)
+    except httpx.ConnectTimeout:
+        return skipped(
+            "saby",
+            f"СБИС: соединение не установилось за {_CONNECT_TIMEOUT_S:.0f} с, "
+            "сверка не выполнена",
+        )
     except httpx.TimeoutException:
-        return skipped("saby", "таймаут запроса, сверка не выполнена")
+        return skipped(
+            "saby",
+            f"СБИС не ответил за {_READ_TIMEOUT_S:.0f} с, сверка не выполнена",
+        )
     except httpx.HTTPStatusError as error:
         return skipped(
             "saby",
             f"СБИС ответил отказом (HTTP {error.response.status_code}), сверка не выполнена",
         )
     except httpx.HTTPError as error:
-        return skipped("saby", f"СБИС недоступен: {error.__class__.__name__}")
+        return skipped("saby", source_unavailable("СБИС", error))
+
+
+OPENCORPORATES_NO_TOKEN = (
+    "OpenCorporates без токена отвечает отказом: задайте бесплатный "
+    "OPENCORPORATES_API_TOKEN в .env. Сверка не выполнена"
+)
 
 
 def _opencorporates(name: str, session: httpx.Client) -> SourceHit:
     catalog = load_catalog()
     source = catalog.source("counterparty", "opencorporates")
-    params: dict[str, str | int] = {"q": name, "per_page": 5}
     token = catalog.secret(source) if source else ""
-    if token:
-        params["api_token"] = token
+    if not token:
+        # Анонимный запрос к v0.4 отвечает 401 (проверено 15.09.2026).
+        # Тратить на него секунду каждого прогона незачем.
+        return skipped("opencorporates", OPENCORPORATES_NO_TOKEN)
+    params: dict[str, str | int] = {"q": name, "per_page": 5, "api_token": token}
     try:
         response = session.get(_OC_SEARCH, params=params)
         response.raise_for_status()
@@ -330,13 +434,15 @@ def _opencorporates(name: str, session: httpx.Client) -> SourceHit:
     except httpx.TimeoutException:
         return skipped("opencorporates", "таймаут запроса, сверка не выполнена")
     except httpx.HTTPStatusError as error:
+        code = error.response.status_code
+        if code in (401, 403):
+            return skipped("opencorporates", OPENCORPORATES_NO_TOKEN)
         return skipped(
             "opencorporates",
-            f"OpenCorporates ответил отказом (HTTP {error.response.status_code}), "
-            "сверка не выполнена",
+            f"OpenCorporates ответил отказом (HTTP {code}), сверка не выполнена",
         )
     except httpx.HTTPError as error:
-        return skipped("opencorporates", f"OpenCorporates недоступен: {error.__class__.__name__}")
+        return skipped("opencorporates", source_unavailable("OpenCorporates", error))
     except (ValueError, TypeError):
         return skipped("opencorporates", "OpenCorporates вернул неразборчивый ответ")
 
@@ -419,7 +525,7 @@ def _gleif(name: str, session: httpx.Client) -> SourceHit:
             f"GLEIF ответил отказом (HTTP {error.response.status_code}), сверка не выполнена",
         )
     except httpx.HTTPError as error:
-        return skipped("gleif", f"GLEIF недоступен: {error.__class__.__name__}")
+        return skipped("gleif", source_unavailable("GLEIF", error))
     except (ValueError, TypeError):
         return skipped("gleif", "GLEIF вернул неразборчивый ответ")
 

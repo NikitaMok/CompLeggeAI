@@ -18,12 +18,16 @@ from reportlab.lib.units import mm
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.platypus import (
+    KeepTogether,
     Paragraph,
     SimpleDocTemplate,
     Spacer,
+    Table,
+    TableStyle,
 )
 
 from app.norms.index import get_norms
+from app.report.analysis import Assessment, assess_party, assess_wallet
 from app.report.serialize import STATUS_LABEL, quote_norms_for
 from app.rules.engine import ContractStatus, Finding, FindingStatus, Report
 from app.rules.guardrail import assert_clean
@@ -64,12 +68,35 @@ SUBTITLE = (
     "на соответствие требованиям Федерального закона от 04.08.2026 № 282-ФЗ "
     "и связанных актов"
 )
+NOTICE_TITLE = "Правовой статус документа"
+NOTICE_LEAD = (
+    "Настоящий документ сформирован программным средством предварительного "
+    "автоматизированного контроля и носит информационно-справочный характер."
+)
+NOTICE_ITEMS = (
+    "юридической консультацией, правовым заключением или иным документом, "
+    "выражающим позицию квалифицированного юриста;",
+    "подтверждением соответствия договора требованиям законодательства "
+    "Российской Федерации;",
+    "документом, предназначенным для представления в кредитную организацию, "
+    "налоговый или иной государственный орган либо в суд в подтверждение "
+    "такого соответствия;",
+    "цифровым анализом в значении статьи 35 Федерального закона "
+    "от 04.08.2026 № 282-ФЗ и не заменяет его.",
+)
+NOTICE_SOURCES = (
+    "Сведения, полученные из внешних источников, приведены по состоянию "
+    "на момент запроса и подлежат самостоятельной проверке. Отсутствие "
+    "сведений по источнику означает, что сверка не выполнена, и не "
+    "равнозначно отсутствию риска."
+)
+NOTICE_LIABILITY = (
+    "Решения о заключении, изменении и исполнении договора принимаются "
+    "пользователем самостоятельно. Ответственность за такие решения "
+    "и их последствия несёт лицо, их принявшее."
+)
 DISCLAIMER = (
-    "Предварительный отчёт. Не юридическая консультация и не замена "
-    "проверки договора юристом. Банку, налоговому органу и контрагенту "
-    "предъявлять нельзя. Перед любым использованием перепроверить вручную. "
-    "Оценка адреса не является цифровым анализом по статье 35 Федерального "
-    "закона от 04.08.2026 № 282-ФЗ."
+    f"{NOTICE_LEAD} Документ не является: " + " ".join(NOTICE_ITEMS)
 )
 FOOTER = (
     "Предварительный отчёт. Перепроверить вручную. Не для банка. "
@@ -79,16 +106,25 @@ SECTION_BLOCKING = "Нарушены обязательные требовани
 SECTION_ADVISORY = "Замечания"
 SECTION_DEFERRED = "Нормы, вступающие в силу позднее"
 SECTION_MANUAL = "Требует оценки юриста"
-SECTION_CONTRACT = "1. Договор"
+SECTION_CONTRACT = "Блок 1. Договор"
 SECTION_CLAUSES = "Оговорки, которые формальная проверка не ловит"
-SECTION_WALLET = "2. Кошелёк"
-SECTION_PARTY = "3. Контрагент"
+SECTION_WALLET = "Блок 2. Адрес расчёта"
+SECTION_PARTY = "Блок 3. Стороны и иные лица, названные в договоре"
 WALLET_EMPTY = "В тексте договора не найден адрес кошелька. Оценка по открытым данным не выполнялась."
 WALLET_NOT_ANALYSIS = (
     "Оценка адреса по открытым данным не является цифровым анализом "
     "в смысле статьи 35 Федерального закона от 04.08.2026 № 282-ФЗ."
 )
-PARTY_EMPTY = "сверка не выполнена: в прогоне нет данных о сторонах"
+WALLET_NOT_SCREENED = (
+    "Коммерческий скоринг адреса не выполнялся: ни один из подключаемых "
+    "сервисов не отработал. Оценка ниже построена только на открытых данных "
+    "блокчейна."
+)
+PARTY_EMPTY = "Сверка не выполнена: в прогоне нет данных о сторонах."
+HEAD_ESTABLISHED = "Установлено"
+HEAD_CONCERNS = "Обращает на себя внимание"
+HEAD_GAPS = "Не установлено"
+HEAD_MANUAL = "Проверить до подписания"
 LLM_SILENT = (
     "Локальная модель не ответила. Вердикт поставлен по матрице правил; "
     "смысл нестандартных оговорок модель не разбирала."
@@ -96,6 +132,10 @@ LLM_SILENT = (
 LLM_USED = (
     "Локальная модель разобрала оговорки, которые не ловятся регулярками. "
     "Вердикт поставлен матрицей правил."
+)
+CLAUSES_PARTIAL = (
+    "Раздел заполнен не по всему тексту договора. Пустая строка по оговорке "
+    "означает только то, что модель её не выписала."
 )
 
 
@@ -202,6 +242,52 @@ def _styles(font: str) -> dict[str, ParagraphStyle]:
             textColor=HexColor("#222222"),
             spaceAfter=4,
         ),
+        "verdict": ParagraphStyle(
+            "verdict",
+            fontName=font,
+            fontSize=9.5,
+            leading=13,
+            leftIndent=10,
+            spaceAfter=5,
+            textColor=HexColor("#8A3324"),
+        ),
+        "subhead": ParagraphStyle(
+            "subhead",
+            fontName=font,
+            fontSize=8.5,
+            leading=11,
+            leftIndent=10,
+            spaceBefore=4,
+            spaceAfter=2,
+            textColor=HexColor("#333333"),
+        ),
+        "notice_head": ParagraphStyle(
+            "notice_head",
+            fontName=font,
+            fontSize=9.5,
+            leading=13,
+            spaceAfter=4,
+            textColor=HexColor("#6B4E16"),
+        ),
+        "notice": ParagraphStyle(
+            "notice",
+            fontName=font,
+            fontSize=8,
+            leading=11,
+            alignment=TA_JUSTIFY,
+            spaceAfter=3,
+            textColor=HexColor("#2B2B2B"),
+        ),
+        "notice_item": ParagraphStyle(
+            "notice_item",
+            fontName=font,
+            fontSize=8,
+            leading=11,
+            leftIndent=10,
+            alignment=TA_JUSTIFY,
+            spaceAfter=2,
+            textColor=HexColor("#2B2B2B"),
+        ),
         "disclaimer": ParagraphStyle(
             "disclaimer",
             fontName=font,
@@ -222,6 +308,61 @@ def _footer(canvas, doc) -> None:
     canvas.drawString(18 * mm, 12 * mm, FOOTER)
     canvas.drawRightString(A4[0] - 18 * mm, 12 * mm, str(doc.page))
     canvas.restoreState()
+
+
+def _notice_block(styles: dict[str, ParagraphStyle]) -> KeepTogether:
+    """Правовая оговорка отдельной рамкой в начале документа.
+
+    Она стоит первой намеренно: читатель должен увидеть границы применения
+    раньше, чем выводы, а не после них мелким шрифтом.
+    """
+    inner: list = [
+        Paragraph(_xml(NOTICE_TITLE), styles["notice_head"]),
+        Paragraph(_xml(NOTICE_LEAD), styles["notice"]),
+        Paragraph("Документ не является:", styles["notice"]),
+    ]
+    for number, item in enumerate(NOTICE_ITEMS, start=1):
+        inner.append(Paragraph(_xml(f"{number}) {item}"), styles["notice_item"]))
+    inner.append(Paragraph(_xml(NOTICE_SOURCES), styles["notice"]))
+    inner.append(Paragraph(_xml(NOTICE_LIABILITY), styles["notice"]))
+
+    table = Table([[inner]], colWidths=[A4[0] - 36 * mm])
+    table.setStyle(
+        TableStyle(
+            [
+                ("BOX", (0, 0), (-1, -1), 0.8, HexColor("#8A6D3B")),
+                ("BACKGROUND", (0, 0), (-1, -1), HexColor("#FBF7EF")),
+                ("LEFTPADDING", (0, 0), (-1, -1), 8),
+                ("RIGHTPADDING", (0, 0), (-1, -1), 8),
+                ("TOPPADDING", (0, 0), (-1, -1), 6),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+            ]
+        )
+    )
+    return KeepTogether([table, Spacer(1, 10)])
+
+
+def _assessment_blocks(
+    assessment: Assessment, styles: dict[str, ParagraphStyle]
+) -> list:
+    """Разбор одного объекта: вывод, затем четыре именованных списка."""
+    blocks: list = [
+        Paragraph(_xml(assessment.subject), styles["body"]),
+        Paragraph(_xml(assessment.headline), styles["verdict"]),
+    ]
+    for head, lines in (
+        (HEAD_ESTABLISHED, assessment.established),
+        (HEAD_CONCERNS, assessment.concerns),
+        (HEAD_GAPS, assessment.gaps),
+        (HEAD_MANUAL, assessment.manual),
+    ):
+        if not lines:
+            continue
+        blocks.append(Paragraph(_xml(head), styles["subhead"]))
+        for line in lines:
+            blocks.append(Paragraph(_xml(f"— {line}"), styles["indent"]))
+    blocks.append(Spacer(1, 8))
+    return blocks
 
 
 def _finding_blocks(
@@ -270,6 +411,14 @@ def _llm_status_line(llm) -> str:
     if payload.get("available"):
         model = str(payload.get("model") or "").strip()
         line = LLM_USED if not model else f"{LLM_USED} Модель: {model}."
+        coverage = payload.get("coverage") or {}
+        summary = str(coverage.get("summary") or "").strip()
+        if summary and not coverage.get("complete", True):
+            line = f"{line} Покрытие: {summary}."
+        tier = payload.get("tier") or {}
+        note = str(tier.get("note") or "").strip()
+        if note and tier.get("tier") in ("limited", "unsupported", "unknown"):
+            line = f"{line} {note}"
         assert_clean(line)
         return line
     detail = str(payload.get("detail") or "").strip()
@@ -291,6 +440,16 @@ def render_pdf(
         TITLE,
         SUBTITLE,
         DISCLAIMER,
+        NOTICE_TITLE,
+        NOTICE_LEAD,
+        NOTICE_SOURCES,
+        NOTICE_LIABILITY,
+        *NOTICE_ITEMS,
+        HEAD_ESTABLISHED,
+        HEAD_CONCERNS,
+        HEAD_GAPS,
+        HEAD_MANUAL,
+        WALLET_NOT_SCREENED,
         FOOTER,
         SECTION_BLOCKING,
         SECTION_ADVISORY,
@@ -322,6 +481,7 @@ def render_pdf(
     story: list = [
         Paragraph(_xml(TITLE), styles["title"]),
         Paragraph(_xml(SUBTITLE), styles["subtitle"]),
+        _notice_block(styles),
         Paragraph(_xml(f"Статус: {STATUS_LABEL[report.status]}"), styles["status"]),
         Paragraph(_xml(f"Документ: {Path(source_name).name}"), styles["meta"]),
         Paragraph(
@@ -336,7 +496,6 @@ def render_pdf(
             ),
             styles["meta"],
         ),
-        Paragraph(_xml(DISCLAIMER), styles["disclaimer"]),
     ]
     llm_line = _llm_status_line(llm)
     if llm_line:
@@ -372,7 +531,18 @@ def render_pdf(
         story.append(Paragraph(_xml(SECTION_CLAUSES), styles["heading"]))
         story.append(Paragraph(_xml(str(payload.get("detail") or "")), styles["body"]))
         if payload.get("model"):
-            story.append(Paragraph(_xml(f"модель: {payload['model']}"), styles["indent"]))
+            model_line = f"модель: {payload['model']}"
+            tier = payload.get("tier") or {}
+            if tier.get("label"):
+                model_line += f" ({tier['label']})"
+            story.append(Paragraph(_xml(model_line), styles["indent"]))
+        coverage = payload.get("coverage") or {}
+        # Покрытие имеет смысл, только если модель вообще отвечала: иначе
+        # строка «прочитала 0%» дублирует «модель не ответила».
+        if payload.get("available") and coverage.get("summary"):
+            story.append(Paragraph(_xml(str(coverage["summary"])), styles["indent"]))
+        if payload.get("available") and not coverage.get("complete", True):
+            story.append(Paragraph(_xml(CLAUSES_PARTIAL), styles["quote"]))
         for note in payload.get("notes") or []:
             present = note.get("present")
             mark = "есть в тексте" if present else "в тексте не видно" if present is False else "не ясно"
@@ -388,19 +558,7 @@ def render_pdf(
     if address_scores:
         for item in address_scores:
             payload = item.to_dict() if hasattr(item, "to_dict") else item
-            line = (
-                f"{payload.get('address')} ({payload.get('network')}): "
-                f"{payload.get('band')}"
-            )
-            if payload.get("score") is not None:
-                line += f", оценка {payload['score']}"
-            story.append(Paragraph(_xml(line), styles["body"]))
-            for factor in payload.get("factors") or []:
-                story.append(Paragraph(_xml(factor), styles["indent"]))
-            for label in payload.get("labels") or []:
-                story.append(Paragraph(_xml(f"метка: {label}"), styles["indent"]))
-            if payload.get("error"):
-                story.append(Paragraph(_xml(str(payload["error"])), styles["indent"]))
+            story.extend(_assessment_blocks(assess_wallet(payload), styles))
             for note in payload.get("source_notes") or []:
                 story.append(Paragraph(_xml(str(note)), styles["indent"]))
     else:
@@ -410,15 +568,7 @@ def render_pdf(
     if counterparties:
         for item in counterparties:
             payload = item.to_dict() if hasattr(item, "to_dict") else item
-            who = payload.get("name") or payload.get("inn") or "сторона не названа"
-            story.append(Paragraph(_xml(str(who)), styles["body"]))
-            if payload.get("foreign"):
-                story.append(Paragraph(_xml("иностранная сторона"), styles["indent"]))
-            if payload.get("inn"):
-                story.append(Paragraph(_xml(f"ИНН {payload['inn']}"), styles["indent"]))
-            story.append(Paragraph(_xml(str(payload.get("summary") or "")), styles["indent"]))
-            for hit in payload.get("hits") or []:
-                story.append(Paragraph(_xml(str(hit.get("detail") or hit.get("source"))), styles["indent"]))
+            story.extend(_assessment_blocks(assess_party(payload), styles))
     else:
         story.append(Paragraph(_xml(PARTY_EMPTY), styles["body"]))
 
@@ -431,7 +581,7 @@ def render_pdf(
         topMargin=16 * mm,
         bottomMargin=20 * mm,
         title=TITLE,
-        author="LexCryptoAI",
+        author="CompLeggeAI",
     )
     document.build(story, onFirstPage=_footer, onLaterPages=_footer)
     return buffer.getvalue()

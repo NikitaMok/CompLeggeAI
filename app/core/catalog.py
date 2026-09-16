@@ -22,17 +22,23 @@ class LlmSettings(BaseModel):
 class Source(BaseModel):
     id: str
     enabled: bool
+    # free — работает без ключа; paid — ключ клиента обязателен;
+    # self_hosted — сервис поднимается рядом, ключ не нужен, нужен адрес.
     tier: str
     what: str = ""
     base_url: str | None = None
     env_key: str | None = None
     module: str | None = None
+    # Бесплатный источник, который без ключа всё равно не отвечает
+    # (OpenCorporates отдаёт 401 анонимному запросу).
+    required_key: bool = False
 
 
 class Catalog(BaseModel):
     llm: LlmSettings
     wallet: list[Source] = Field(default_factory=list)
     counterparty: list[Source] = Field(default_factory=list)
+    sanctions: list[Source] = Field(default_factory=list)
 
     def enabled(self, group: str, *, tier: str | None = None) -> list[Source]:
         items = getattr(self, group)
@@ -86,4 +92,14 @@ def load_catalog(path: Path | None = None) -> Catalog:
             "base_url": str(settings.ollama_base_url or catalog.llm.base_url),
         }
     )
-    return catalog.model_copy(update={"llm": llm})
+    # Адрес сервера скрининга перекрывается переменной окружения: в Docker
+    # он виден под другим именем, чем на хосте, а yaml один на оба случая.
+    sanctions = list(catalog.sanctions)
+    if settings.opensanctions_base_url:
+        sanctions = [
+            item.model_copy(update={"base_url": str(settings.opensanctions_base_url)})
+            if item.id == "opensanctions"
+            else item
+            for item in sanctions
+        ]
+    return catalog.model_copy(update={"llm": llm, "sanctions": sanctions})

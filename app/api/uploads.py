@@ -28,7 +28,7 @@ def validate_upload(filename: str | None, content: bytes, max_bytes: int) -> str
 @contextmanager
 def stored_upload(content: bytes, suffix: str, *, root: Path) -> Iterator[Path]:
     root.mkdir(parents=True, exist_ok=True)
-    directory = Path(tempfile.mkdtemp(prefix="lex-", dir=root))
+    directory = Path(tempfile.mkdtemp(prefix="complegge-", dir=root))
     path = directory / f"upload{suffix}"
     try:
         path.write_bytes(content)

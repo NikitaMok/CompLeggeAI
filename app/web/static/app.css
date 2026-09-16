@@ -114,6 +114,13 @@ button[type="button"] {
   margin: 0;
 }
 
+/* Предупреждение о неполноте разбора: не ошибка, но читать надо. */
+.warn {
+  color: var(--yellow);
+  font-size: 0.95rem;
+  margin: 0.25rem 0;
+}
+
 .status {
   font-size: 1.1rem;
   margin: 0 0 0.75rem;
@@ -142,4 +149,20 @@ button[type="button"] {
 
 footer {
   border-top: 1px solid var(--line);
+}
+
+.subject {
+  font-weight: 600;
+  margin: 12px 0 2px;
+}
+
+.verdict {
+  color: #8a3324;
+  margin: 0 0 6px;
+}
+
+.subhead {
+  margin: 8px 0 2px;
+  font-size: 13px;
+  color: #555;
 }

@@ -47,3 +47,7 @@ class ContractView:
 
     def contract_amount(self) -> Decimal | None:
         return self.facts.max_amount("RUB")
+
+    def foreign_contract_amount(self):
+        """Сумма договора в иностранной валюте, если рублёвой в тексте нет."""
+        return self.facts.max_foreign_amount()

@@ -251,3 +251,57 @@ def test_depositary_pass_does_not_claim_registry_hit(compliant, rules):
     assert finding.status is FindingStatus.PASSED
     assert "не выполнялась" in finding.evidence
     assert "890-П" in finding.evidence
+
+
+class TestPaymentSplitting:
+    """Дробление под порог: считаются платежи, а не различные суммы."""
+
+    def _outcome(self, lines: list[str]):
+        from app.parsing.document import Document, SourceFormat
+        from app.rules.contract import ContractView
+        from app.rules.predicates import get_predicate
+
+        view = ContractView.from_document(Document(SourceFormat.DOCX, lines))
+        return get_predicate("no_payment_splitting")(view)
+
+    def test_identical_tranches_just_under_the_threshold_are_a_violation(self):
+        outcome = self._outcome(
+            [
+                "Общая сумма Договора составляет 24 000 000 рублей.",
+                "Оплата производится траншами:",
+                "первый транш — 2 900 000 рублей;",
+                "второй транш — 2 900 000 рублей;",
+                "третий транш — 2 900 000 рублей;",
+                "четвёртый транш — 2 900 000 рублей.",
+            ]
+        )
+
+        assert outcome.verdict.value == "failed"
+        assert "2 900 000" in outcome.evidence
+        assert "3 000 000" in outcome.evidence
+
+    def test_ordinary_small_instalments_are_not_splitting(self):
+        outcome = self._outcome(
+            [
+                "Общая сумма Договора составляет 24 000 000 рублей.",
+                "Авансовый платёж 150 000 рублей.",
+                "Доплата за упаковку 90 000 рублей.",
+            ]
+        )
+
+        assert outcome.verdict.value != "failed"
+
+    def test_schedule_without_amounts_is_left_to_the_lawyer(self):
+        outcome = self._outcome(
+            [
+                "Общая сумма Договора составляет 24 000 000 рублей.",
+                "Оплата производится частями согласно графику платежей.",
+            ]
+        )
+
+        assert outcome.verdict.value == "unresolved"
+
+    def test_no_total_amount_and_no_schedule_passes(self):
+        outcome = self._outcome(["Стороны согласовали порядок приёмки товара."])
+
+        assert outcome.verdict.value == "passed"

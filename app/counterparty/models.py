@@ -13,7 +13,7 @@ from app.rules.guardrail import assert_clean
 
 NOT_PERFORMED = "сверка не выполнена"
 NO_RUSSIAN_INN = (
-    "российского ИНН в тексте нет; сверка по ЕГРЮЛ, Rusprofile и СБИС не выполнялась"
+    "российского ИНН в тексте нет; сверка по реестрам юридических лиц не выполнялась"
 )
 FOREIGN_NOT_PERFORMED = "иностранный контрагент: сверка не выполнена"
 FOREIGN_NOT_FOUND = (
@@ -26,6 +26,10 @@ FOREIGN_NAME_MISMATCH = (
     "запись в иностранном реестре найдена, наименование в договоре с ней не совпадает"
 )
 FOREIGN_INACTIVE = "по открытому реестру организация недействующая или исключена"
+SANCTIONED = (
+    "сторона совпала с записью санкционного либо PEP-перечня: "
+    "совпадение проверить юристу до подписания"
+)
 
 
 @dataclass(frozen=True)
@@ -41,6 +45,11 @@ class SourceHit:
     status: str | None = None
     name_match: bool | None = None
     detail: str = ""
+    # Тревожные признаки, названные самим источником: красные факты
+    # Контур.Фокуса, попадание в санкционный список, статус ликвидации.
+    markers: tuple[str, ...] = ()
+    # Ссылка на карточку у источника, если он её вернул.
+    link: str | None = None
 
     def to_dict(self) -> dict:
         return {
@@ -55,6 +64,8 @@ class SourceHit:
             "status": self.status,
             "name_match": self.name_match,
             "detail": self.detail,
+            "markers": list(self.markers),
+            "link": self.link,
         }
 
 
@@ -65,12 +76,19 @@ class PartyCheck:
     foreign: bool
     hits: tuple[SourceHit, ...]
     summary: str
+    # Кем лицо названо в договоре: сторона, цифровой депозитарий, эмитент.
+    # Пусто, если из текста роль не следует.
+    role: str | None = None
+    # Страна из текста договора: сужает санкционный скрининг.
+    country: str | None = None
 
     def to_dict(self) -> dict:
         return {
             "name": self.name,
             "inn": self.inn,
             "foreign": self.foreign,
+            "role": self.role,
+            "country": self.country,
             "hits": [hit.to_dict() for hit in self.hits],
             "summary": self.summary,
         }
@@ -105,8 +123,13 @@ def _inactive(status: str | None) -> bool:
     lowered = status.lower()
     markers = (
         "ликвидир",
+        # DaData отдаёт LIQUIDATING как «в процессе ликвидации»: корень другой,
+        # а смысл для юриста тот же — с такой стороной договор не подписывают.
+        "ликвидац",
         "исключ",
         "прекращ",
+        "банкрот",
+        "недейств",
         "inactive",
         "dissolved",
         "struck",
@@ -117,6 +140,11 @@ def _inactive(status: str | None) -> bool:
 
 
 def summarize(hits: tuple[SourceHit, ...], *, foreign: bool, has_inn: bool) -> str:
+    # Санкционное совпадение решает раньше всего остального: оно не зависит
+    # ни от наличия ИНН, ни от того, нашлась ли карточка в реестре.
+    if _sanctioned([hit for hit in hits if hit.performed and hit.found]):
+        assert_clean(SANCTIONED)
+        return SANCTIONED
     if foreign:
         return _summarize_foreign(hits)
     if not has_inn:
@@ -137,6 +165,14 @@ def summarize(hits: tuple[SourceHit, ...], *, foreign: bool, has_inn: bool) -> s
         text = "по реестру организация ликвидирована либо исключена из ЕГРЮЛ"
         assert_clean(text)
         return text
+    if _sanctioned(found):
+        assert_clean(SANCTIONED)
+        return SANCTIONED
+    flagged = _markers(found)
+    if flagged:
+        text = "источник назвал тревожные признаки: " + "; ".join(flagged[:3])
+        assert_clean(text)
+        return text
     if mismatch:
         text = "запись в реестре найдена, наименование в договоре с ней не совпадает"
         assert_clean(text)
@@ -146,12 +182,32 @@ def summarize(hits: tuple[SourceHit, ...], *, foreign: bool, has_inn: bool) -> s
     return text
 
 
+def _sanctioned(hits: list[SourceHit]) -> bool:
+    return any(hit.source_id == "opensanctions" and hit.found for hit in hits)
+
+
+def _markers(hits: list[SourceHit]) -> list[str]:
+    """Тревожные признаки, названные источниками, без повторов."""
+    seen: list[str] = []
+    for hit in hits:
+        if hit.source_id == "opensanctions":
+            continue
+        for marker in hit.markers:
+            if marker not in seen:
+                seen.append(marker)
+    return seen
+
+
 def _summarize_foreign(hits: tuple[SourceHit, ...]) -> str:
     performed = [hit for hit in hits if hit.performed]
     if not performed:
         assert_clean(FOREIGN_NOT_PERFORMED)
         return FOREIGN_NOT_PERFORMED
     found = [hit for hit in performed if hit.found]
+    if _sanctioned(found):
+        # Санкционное совпадение важнее того, нашлась ли карточка компании.
+        assert_clean(SANCTIONED)
+        return SANCTIONED
     if not found:
         assert_clean(FOREIGN_NOT_FOUND)
         return FOREIGN_NOT_FOUND

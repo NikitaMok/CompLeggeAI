@@ -4,12 +4,15 @@ from pathlib import Path
 from threading import Lock
 
 from fastapi import FastAPI, File, HTTPException, Query, UploadFile
+from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 
+from app import __version__
 from app.api.uploads import stored_upload, validate_upload
 from app.core.config import PROJECT_ROOT, get_settings
 from app.llm.client import ollama_reachable
+from app.llm.tiers import classify
 from app.norms.hybrid import hybrid_search
 from app.parsing.document import EmptyDocumentError, UnsupportedFormatError
 from app.pipeline import CheckResult, run_check
@@ -22,13 +25,13 @@ from app.rules.guardrail import CircumventionAttempt
 STATIC_DIR = PROJECT_ROOT / "app" / "web" / "static"
 
 app = FastAPI(
-    title="LexCryptoAI",
+    title="CompLeggeAI",
     description=(
         "Проверка внешнеторговых контрактов с расчётами в цифровой валюте "
         "на соответствие ФЗ № 282-ФЗ, 283-ФЗ и 115-ФЗ. "
         "Загруженный файл удаляется сразу после формирования заключения."
     ),
-    version="0.7.0",
+    version=__version__,
 )
 
 if STATIC_DIR.is_dir():
@@ -46,7 +49,7 @@ def _result_key(content: bytes, moment: date | None) -> str:
 
 
 @app.get("/health")
-async def health() -> dict[str, str]:
+async def health() -> dict[str, object]:
     settings = get_settings()
     dense = "off"
     try:
@@ -56,12 +59,17 @@ async def health() -> dict[str, str]:
             dense = "on"
     except Exception:
         dense = "off"
+    # Опрос Ollama ходит по сети: в асинхронном обработчике он занял бы
+    # единственный поток событий на время ожидания.
+    reachable = await run_in_threadpool(ollama_reachable)
+    tier = classify(settings.ollama_model)
     return {
         "status": "ok",
         "env": settings.app_env,
         "version": app.version,
         "dense": dense,
-        "ollama": "on" if ollama_reachable() else "off",
+        "ollama": "on" if reachable else "off",
+        "model": tier.to_dict(),
     }
 
 

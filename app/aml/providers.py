@@ -8,15 +8,17 @@ GoPlus отдаёт публичные метки риска. Платные к�
 
 from __future__ import annotations
 
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from decimal import Decimal
 
 import httpx
 
 from app.aml.score import AddressSnapshot
+from app.core import provider
 from app.core.catalog import load_catalog
 from app.core.config import get_settings
+from app.core.net import source_unavailable
 from app.parsing.extract import WalletAddress
 
 _TIMEOUT = httpx.Timeout(8.0, connect=4.0)
@@ -88,15 +90,16 @@ def fetch_snapshots(
 
 
 def paid_wallet_notes() -> tuple[str, ...]:
-    """Честный статус платных скорингов: включены, но коннектора нет."""
-    catalog = load_catalog()
-    notes: list[str] = []
-    for source in catalog.enabled("wallet", tier="paid"):
-        if catalog.secret(source):
-            notes.append(f"{source.id}: коннектор не реализован, оценка не выполнена")
-        else:
-            notes.append(f"{source.id}: ключ не задан, оценка не выполнена")
-    return tuple(notes)
+    """Источники, включённые в каталоге, но не отработавшие по устройству.
+
+    Про отсутствующий ключ докладывает сам коннектор: он знает, где ключ
+    взять. Здесь остаётся случай, когда запись включена, а коннектора нет.
+    """
+    return tuple(
+        f"{item.id}: {item.detail}"
+        for item in provider.blocked("wallet")
+        if item.status is provider.ProviderStatus.NOT_IMPLEMENTED
+    )
 
 
 def _with_goplus(
@@ -140,7 +143,7 @@ def _goplus(
         )
         return labels, None
     except httpx.HTTPError as error:
-        return (), f"GoPlus недоступен: {error.__class__.__name__}"
+        return (), source_unavailable("GoPlus", error)
     finally:
         if client is None:
             session.close()
@@ -161,64 +164,160 @@ def _tron(address: str, client: httpx.Client | None) -> AddressSnapshot:
         payload = account.json()
         rows = payload.get("data") or []
         if not rows:
-            return AddressSnapshot(address=address, network="TRON", tx_count=0)
+            # Пустая выдача у TronGrid означает неактивированный адрес: записи
+            # о нём в сети нет. Раньше это записывалось как tx_count=0 —
+            # «операций не найдено», то есть измерение вместо факта отсутствия.
+            return AddressSnapshot(
+                address=address,
+                network="TRON",
+                account_found=False,
+                has_activity=False,
+            )
 
         row = rows[0]
-        created = row.get("create_time")
-        created_at = (
-            datetime.fromtimestamp(created / 1000, tz=timezone.utc)
-            if isinstance(created, (int, float)) and created > 0
-            else None
-        )
         usdt = _tron_usdt(row)
-        tx_count = _tron_tx_count(session, address, headers)
+        activity = _tron_activity(session, address, headers)
+        # `create_time` в карточке TronGrid есть не всегда: на живом ответе
+        # 15.09.2026 его не было. Возраст берём по первой операции, иначе — None.
+        created_at = _timestamp(row.get("create_time")) or activity.first_at
         return AddressSnapshot(
             address=address,
             network="TRON",
             created_at=created_at,
-            tx_count=tx_count,
+            tx_count=activity.count,
+            tx_count_is_floor=activity.count_is_floor,
+            has_activity=activity.has_activity,
+            last_activity_at=activity.last_at,
             usdt_balance=usdt,
+            account_found=True,
         )
     except httpx.HTTPError as error:
         return AddressSnapshot(
             address=address,
             network="TRON",
-            error=f"TronGrid недоступен: {error.__class__.__name__}",
+            error=source_unavailable("TronGrid", error),
         )
     finally:
         if client is None:
             session.close()
 
 
+# Контракт USDT в сети TRON. TronGrid перечисляет балансы TRC-20 по адресу
+# контракта, а не по тикеру: в ответе лежит {"TR7NHq…": "12500000"}. Прежний код
+# искал в ключе подстроку «USDT» и не находил её никогда — баланс USDT не читался
+# ни у одного адреса, а функция возвращала ноль как измеренное значение.
+USDT_TRC20_CONTRACT = "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t"
+# У USDT TRC-20 шесть знаков после запятой.
+_USDT_DECIMALS = Decimal(1_000_000)
+
+
 def _tron_usdt(row: dict) -> Decimal | None:
-    tokens = row.get("trc20") or []
+    """Баланс USDT по карточке адреса.
+
+    None — источник не описал балансы TRC-20, и сказать о них нечего.
+    Ноль возвращается только когда список балансов пришёл и USDT в нём нет:
+    это измерение, а не отсутствие данных. Разница попадает в отчёт баллами
+    риска, поэтому смешивать их нельзя.
+    """
+    if "trc20" not in row:
+        return None
+    tokens = row.get("trc20")
+    if not isinstance(tokens, list):
+        return None
     for item in tokens:
         if not isinstance(item, dict):
             continue
-        for symbol, amount in item.items():
-            if "USDT" in str(symbol).upper():
+        for key, amount in item.items():
+            token = str(key)
+            if token == USDT_TRC20_CONTRACT or "USDT" in token.upper():
                 try:
-                    return Decimal(str(amount)) / Decimal(1_000_000)
-                except Exception:
+                    return Decimal(str(amount)) / _USDT_DECIMALS
+                except (ArithmeticError, ValueError):
                     return None
     return Decimal(0)
 
 
-def _tron_tx_count(session: httpx.Client, address: str, headers: dict) -> int | None:
+# Сколько операций запрашиваем одной страницей. Точное число нужно там, где
+# оно и важно: почти пустой адрес. У загруженного адреса берём нижнюю границу
+# и так её и называем, вместо того чтобы молчать.
+_TRON_PAGE = 200
+
+
+@dataclass(frozen=True)
+class TronActivity:
+    """Что удалось узнать об операциях по адресу."""
+
+    count: int | None = None
+    count_is_floor: bool = False
+    has_activity: bool | None = None
+    first_at: datetime | None = None
+    last_at: datetime | None = None
+
+
+def _timestamp(value: object) -> datetime | None:
+    if not isinstance(value, (int, float)) or value <= 0:
+        return None
+    try:
+        return datetime.fromtimestamp(value / 1000, tz=timezone.utc)
+    except (OverflowError, OSError, ValueError):
+        return None
+
+
+def _tron_transactions(
+    session: httpx.Client, address: str, headers: dict, params: dict
+) -> list[dict] | None:
     try:
         response = session.get(
             f"https://api.trongrid.io/v1/accounts/{address}/transactions",
-            params={"limit": 1, "only_confirmed": "true"},
+            params={"only_confirmed": "true", **params},
             headers=headers,
         )
         response.raise_for_status()
-        payload = response.json()
-        data = payload.get("data") or []
-        if not data:
-            return 0
-        return None
+        data = response.json().get("data")
     except httpx.HTTPError:
         return None
+    except ValueError:
+        return None
+    if not isinstance(data, list):
+        return None
+    return [row for row in data if isinstance(row, dict)]
+
+
+def _tron_activity(session: httpx.Client, address: str, headers: dict) -> TronActivity:
+    """Операции по адресу: сколько, когда первая и когда последняя.
+
+    Прошлая версия запрашивала одну операцию и возвращала 0 либо None: у любого
+    живого адреса число операций оказывалось «неизвестно», и адрес получал
+    30 баллов за «нет сведений об истории».
+
+    Возраст берётся отсюда же: в карточке TronGrid поля `create_time`
+    на прогоне 15.09.2026 не оказалось. Дата первой операции для оценки риска
+    подходит лучше — она показывает, когда адрес начал работать.
+    """
+    latest = _tron_transactions(session, address, headers, {"limit": _TRON_PAGE})
+    if latest is None:
+        return TronActivity()
+
+    count = len(latest)
+    if count == 0:
+        return TronActivity(count=0, has_activity=False)
+
+    last_at = _timestamp(latest[0].get("block_timestamp"))
+
+    # Отдельный запрос за самой ранней операцией: страница выше отсортирована
+    # от новых к старым, и по ней возраст адреса не виден.
+    oldest = _tron_transactions(
+        session, address, headers, {"limit": 1, "order_by": "block_timestamp,asc"}
+    )
+    first_at = _timestamp(oldest[0].get("block_timestamp")) if oldest else None
+
+    return TronActivity(
+        count=count,
+        count_is_floor=count >= _TRON_PAGE,
+        has_activity=True,
+        first_at=first_at,
+        last_at=last_at,
+    )
 
 
 def _evm(address: str, client: httpx.Client | None) -> AddressSnapshot:
@@ -269,7 +368,7 @@ def _evm(address: str, client: httpx.Client | None) -> AddressSnapshot:
         return AddressSnapshot(
             address=address,
             network="EVM",
-            error=f"Etherscan недоступен: {error.__class__.__name__}",
+            error=source_unavailable("Etherscan", error),
         )
     finally:
         if client is None:

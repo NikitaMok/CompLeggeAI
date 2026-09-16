@@ -24,15 +24,42 @@ class Settings(BaseSettings):
     ollama_model: str = "llama3.3:70b"
     # 70B на первом токене может думать минуты; меньше — обрыв посреди ответа.
     ollama_timeout_s: float = 300.0
+    # Длинный договор идёт в модель окнами по 24 000 знаков с перекрытием.
+    # Потолок нужен, чтобы договор на тысячу страниц не превратил один прогон
+    # в часы работы модели: непрочитанная часть честно названа в отчёте.
+    llm_max_windows: int = 6
 
+    # --- ключи клиента: платный скоринг криптоадреса ---
+    amlbot_api_key: str = ""
+    # Публичной спецификации у AMLBot нет: адрес запроса выдаётся вместе
+    # с доступом. Шаблон подставляет {address}, {asset} и {key}.
+    amlbot_api_url: str = ""
+    misttrack_api_key: str = ""
     chainalysis_api_key: str = ""
     elliptic_api_key: str = ""
     bitok_api_key: str = ""
+
+    # --- ключи клиента: проверка контрагента ---
+    # Бесплатный ключ dadata.ru, 10 000 запросов в сутки: заменяет прямой
+    # запрос к ЕГРЮЛ, который с рабочей машины часто не проходит.
+    dadata_api_key: str = ""
     kontur_focus_key: str = ""
     spark_api_key: str = ""
     sbis_api_key: str = ""
-    # Не обязателен: без токена OpenCorporates отвечает с лимитом публичного API.
+    # Обязателен: анонимный запрос к OpenCorporates v0.4 отвечает 401.
     opencorporates_api_token: str = ""
+
+    # --- санкционный скрининг ---
+    # Пусто для своего yente рядом с сервисом; ключ — только для облачного API.
+    opensanctions_api_key: str = ""
+    # Перекрывает адрес из providers.yaml: в Docker сервер скрининга виден
+    # как http://yente:8000, на хосте — как http://127.0.0.1:8001.
+    opensanctions_base_url: str = ""
+    # Сколько ждать ответа скрининга: свой yente отвечает за миллисекунды,
+    # облачный — дольше.
+    sanctions_timeout_s: float = 15.0
+    # Порог совпадения имени, с которого запись считается попаданием.
+    sanctions_match_threshold: float = 0.75
 
     chroma_persist_dir: Path = PROJECT_ROOT / "data" / "chroma"
     chroma_collection: str = "legal_norms"

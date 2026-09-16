@@ -51,33 +51,58 @@ function findingsHtml(title, items) {
   return `<h2>${title}</h2>${blocks.join("")}`;
 }
 
-function walletHtml(scores) {
-  if (!scores || !scores.length) {
-    return `<h2>2. Кошелёк</h2><p>В тексте нет адреса. Оценка по открытым данным не выполнялась.</p>`;
-  }
-  const blocks = scores.map((item) => {
-    const factors = (item.factors || []).map((factor) => `<p>${esc(factor)}</p>`).join("");
-    const labels = (item.labels || []).map((label) => `<p>метка: ${esc(label)}</p>`).join("");
-    const notes = (item.source_notes || []).map((note) => `<p>${esc(note)}</p>`).join("");
-    const err = item.error ? `<p>${esc(item.error)}</p>` : "";
-    const score = item.score != null ? `, оценка ${esc(item.score)}` : "";
-    return `<article class="finding"><p>${esc(item.address)} (${esc(item.network)}): ${esc(item.band)}${score}</p>${factors}${labels}${notes}${err}<p>${esc(item.disclaimer || "")}</p></article>`;
-  }).join("");
-  return `<h2>2. Кошелёк</h2>${blocks}`;
+function assessmentHtml(item) {
+  const group = (head, lines, cls) => {
+    if (!lines || !lines.length) return "";
+    const rows = lines.map((line) => `<p class="${cls}">— ${esc(line)}</p>`).join("");
+    return `<p class="subhead">${esc(head)}</p>${rows}`;
+  };
+  return [
+    `<p class="subject">${esc(item.subject || "")}</p>`,
+    `<p class="verdict">${esc(item.headline || "")}</p>`,
+    group("Установлено", item.established, ""),
+    group("Обращает на себя внимание", item.concerns, "warn"),
+    group("Не установлено", item.gaps, "warn"),
+    group("Проверить до подписания", item.manual, ""),
+  ].join("");
 }
 
-function partyHtml(parties) {
-  if (!parties || !parties.length) {
-    return `<h2>3. Контрагент</h2><p>сверка не выполнена</p>`;
+function walletHtml(scores, analysis) {
+  if (!scores || !scores.length) {
+    return `<h2>Блок 2. Адрес расчёта</h2><p>В тексте нет адреса. Оценка не выполнялась.</p>`;
   }
+  const blocks = (analysis || []).map((item, index) => {
+    const score = scores[index] || {};
+    const notes = (score.source_notes || []).map((note) => `<p>${esc(note)}</p>`).join("");
+    const disclaimer = `<p class="quote">${esc(score.disclaimer || "")}</p>`;
+    return `<article class="finding">${assessmentHtml(item)}${notes}${disclaimer}</article>`;
+  }).join("");
+  return `<h2>Блок 2. Адрес расчёта</h2>${blocks}`;
+}
+
+function partyHtml(parties, analysis) {
+  if (!parties || !parties.length) {
+    return `<h2>Блок 3. Стороны и иные лица, названные в договоре</h2><p>сверка не выполнена</p>`;
+  }
+  const blocks = (analysis || [])
+    .map((item) => `<article class="finding">${assessmentHtml(item)}</article>`)
+    .join("");
+  return `<h2>Блок 3. Стороны и иные лица, названные в договоре</h2>${blocks}`;
+}
   const blocks = parties.map((item) => {
-    const who = esc(item.name || item.inn || "сторона не названа");
+    const role = item.role ? ` — ${esc(item.role)}` : "";
+    const who = esc(item.name || item.inn || "сторона не названа") + role;
     const inn = item.inn ? `<p>ИНН ${esc(item.inn)}</p>` : "";
     const foreign = item.foreign ? `<p>иностранная сторона</p>` : "";
-    const hits = (item.hits || []).map((hit) => `<p>${esc(hit.detail || hit.source)}</p>`).join("");
+    const hits = (item.hits || []).map((hit) => {
+      const markers = (hit.markers || [])
+        .map((marker) => `<p class="warn">— ${esc(marker)}</p>`)
+        .join("");
+      return `<p>${esc(hit.detail || hit.source)}</p>${markers}`;
+    }).join("");
     return `<article class="finding"><p>${who}</p>${foreign}${inn}<p>${esc(item.summary || "")}</p>${hits}</article>`;
   }).join("");
-  return `<h2>3. Контрагент</h2>${blocks}`;
+  return `<h2>3. Лица, названные в договоре</h2>${blocks}`;
 }
 
 function llmHtml(llm) {
@@ -88,9 +113,23 @@ function llmHtml(llm) {
     const reading = note.reading ? `<p>${esc(note.reading)}</p>` : "";
     return `<article class="finding"><p>[${esc(note.code)}] ${esc(mark)}</p>${quote}${reading}</article>`;
   }).join("");
-  const model = llm.model ? `<p>модель: ${esc(llm.model)}</p>` : "";
+  // Имя модели показываем, только если она отвечала: иначе строка
+  // «модель: llama3.3:70b» под сообщением «Ollama недоступна» читается так,
+  // будто разбор всё-таки был.
+  const tier = llm.tier || {};
+  const label = tier.label ? ` (${esc(tier.label)})` : "";
+  const model = llm.available && llm.model
+    ? `<p>модель: ${esc(llm.model)}${label}</p>`
+    : "";
+  const warn = llm.available && tier.note && ["limited", "unsupported", "unknown"].includes(tier.tier)
+    ? `<p class="warn">${esc(tier.note)}</p>`
+    : "";
+  const coverage = llm.coverage || {};
+  const partial = llm.available && coverage.summary && coverage.complete === false
+    ? `<p class="warn">Покрытие: ${esc(coverage.summary)}.</p>`
+    : "";
   const extra = notes ? `<h2>Оговорки, которые формальная проверка не ловит</h2>${notes}` : "";
-  return `<p>${esc(llm.detail || "")}</p>${model}${extra}`;
+  return `<p>${esc(llm.detail || "")}</p>${model}${warn}${partial}${extra}`;
 }
 
 function renderReport(payload) {
@@ -106,8 +145,8 @@ function renderReport(payload) {
     ${findingsHtml("Замечания", payload.advisory)}
     ${findingsHtml("Нормы, вступающие в силу позднее", payload.deferred)}
     ${findingsHtml("Требует оценки юриста", payload.manual)}
-    ${walletHtml(payload.address_scores)}
-    ${partyHtml(payload.counterparties)}
+    ${walletHtml(payload.address_scores, payload.wallet_analysis)}
+    ${partyHtml(payload.counterparties, payload.party_analysis)}
   `;
 }
 

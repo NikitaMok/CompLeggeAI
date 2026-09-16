@@ -5,8 +5,50 @@ services:
       - "8000:8000"
     extra_hosts:
       - "host.docker.internal:host-gateway"
+    env_file:
+      - path: .env
+        required: false
     environment:
       APP_ENV: production
       UPLOAD_TMP_DIR: /tmp/uploads
       OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://host.docker.internal:11434}
       OLLAMA_MODEL: ${OLLAMA_MODEL:-llama3.3:70b}
+      # Пока профиль sanctions не поднят, адрес просто не отвечает,
+      # и в заключении честно написано, что скрининг не выполнен.
+      OPENSANCTIONS_BASE_URL: ${OPENSANCTIONS_BASE_URL:-http://yente:8000}
+
+  # Санкционный и PEP-скрининг внутри периметра: наименования контрагентов
+  # не уходят даже в OpenSanctions. Поднимается отдельным профилем, потому
+  # что индексу нужно около 8 ГБ памяти:
+  #     docker compose --profile sanctions up
+  # Первая загрузка данных занимает несколько минут; дальше yente обновляет
+  # их сам раз в час. Для коммерческого использования нужна лицензия
+  # на данные OpenSanctions.
+  yente:
+    image: ghcr.io/opensanctions/yente:latest
+    profiles: ["sanctions"]
+    ports:
+      - "8001:8000"
+    depends_on:
+      - yente-index
+    environment:
+      YENTE_INDEX_TYPE: elasticsearch
+      YENTE_INDEX_URL: http://yente-index:9200
+      YENTE_UPDATE_TOKEN: ""
+
+  yente-index:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.15.0
+    profiles: ["sanctions"]
+    environment:
+      discovery.type: single-node
+      xpack.security.enabled: "false"
+      ES_JAVA_OPTS: "-Xms1g -Xmx1g"
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+    volumes:
+      - yente-index-data:/usr/share/elasticsearch/data
+
+volumes:
+  yente-index-data:

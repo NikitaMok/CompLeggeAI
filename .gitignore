@@ -61,6 +61,10 @@ logs/
 
 # отчёты eval — артефакты прогонов
 data/eval/last_run.json
+# результат приёмочного прогона — измерение конкретной машины
+data/eval/llm_gate.json
+# колёса, скачанные вручную для окружения без доступа к PyPI
+_wheels/
 
 # frontend
 node_modules/

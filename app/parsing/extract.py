@@ -52,13 +52,42 @@ _AMOUNT = re.compile(
 )
 
 _INN = re.compile(r"ИНН[\s:№]*(\d{10}|\d{12})\b", re.IGNORECASE)
+# Наименование организации может быть разорвано переносом строки: извлечение
+# из PDF ставит перенос там, где в DOCX стоял пробел. Поэтому внутри
+# наименования допускается любой пробельный символ, а найденное потом
+# схлопывается в одну строку.
+# В преамбуле договора организационно-правовую форму пишут словами
+# («Общество с ограниченной ответственностью «Ромашка»»), а дальше по тексту —
+# аббревиатурой. Ловим обе записи: иначе сторона остаётся без наименования
+# и в заключение попадает голый ИНН.
 _RU_ORG = re.compile(
-    r"(?:ООО|АО|ПАО|НАО|ЗАО|ОАО|ИП)\s+[«\"'][^»\"']{2,160}[»\"']",
+    r"(?:"
+    r"Обществ\w*\s+с\s+ограниченной\s+ответственностью"
+    r"|Акционерн\w*\s+обществ\w*"
+    r"|Публичн\w*\s+акционерн\w*\s+обществ\w*"
+    r"|Непубличн\w*\s+акционерн\w*\s+обществ\w*"
+    r"|Закрыт\w*\s+акционерн\w*\s+обществ\w*"
+    r"|Открыт\w*\s+акционерн\w*\s+обществ\w*"
+    r"|Индивидуальн\w*\s+предпринимател\w*"
+    r"|ООО|АО|ПАО|НАО|ЗАО|ОАО|ИП"
+    r")\s*[«\"'][^»\"']{2,160}[»\"']",
     re.IGNORECASE,
 )
+# Формы иностранных компаний. Точка после Ltd и Inc ставится не всегда,
+# а партнёрства и индийские частные компании пишутся LLP и Pvt Ltd —
+# без этих вариантов иностранная сторона из договора просто исчезала.
+_EN_SUFFIX = (
+    r"Co\.,?\s*Ltd\.?"
+    r"|(?:Pte|Pvt|Pty|Sdn)\.?\s*(?:Ltd|Bhd)\.?"
+    r"|Ltd\.?|Limited|LLP\.?|L\.?L\.?C\.?|LLC"
+    r"|Inc\.?|Incorporated|Corp\.?|Corporation"
+    r"|GmbH|mbH|AG|KG|S\.?A\.?S?\.?|S\.?p\.?A\.?|S\.?R\.?L\.?"
+    r"|B\.?V\.?|N\.?V\.?|A/S|ApS|AB|Oy|OyJ"
+    r"|PLC|plc|JSC|OJSC|CJSC"
+)
 _EN_ORG = re.compile(
-    r"\b[A-Z][A-Za-z0-9&.,' \-]{2,80}"
-    r"(?:Co\.,?\s*Ltd\.?|Pte\.?\s*Ltd\.?|Ltd\.|Limited|Inc\.|GmbH|LLC|Corp\.)\b"
+    r"\b[A-Z][A-Za-z0-9&.,'\-\s]{2,80}?"
+    rf"(?:{_EN_SUFFIX})\b"
 )
 
 _FOREIGN_TRADE = re.compile(r"внешнеторгов\w*", re.IGNORECASE)
@@ -82,6 +111,10 @@ class WalletAddress:
 class PartyMention:
     name: str
     inn: str | None = None
+    # Кем лицо названо в договоре. Регулярка находит все организации подряд:
+    # без роли цифровой депозитарий и эмитент стейблкоина попадали в отчёт
+    # наравне со сторонами сделки, под общим заголовком «контрагент».
+    role: str | None = None
 
 
 @dataclass(frozen=True)
@@ -109,6 +142,17 @@ class ExtractedFacts:
     def max_amount(self, currency: str = "RUB") -> Decimal | None:
         values = [amount.value for amount in self.amounts if amount.currency == currency]
         return max(values) if values else None
+
+    def max_foreign_amount(self) -> MoneyAmount | None:
+        """Наибольшая сумма не в рублях.
+
+        Договор ВЭД чаще всего номинирован в долларах, евро или юанях, а пороги
+        115-ФЗ и Инструкции № 181-И установлены в рублях либо в эквиваленте.
+        Пересчитать без курса нельзя, но и молчать нельзя: молчание правила
+        читается как «порог не достигнут».
+        """
+        foreign = [amount for amount in self.amounts if amount.currency != "RUB"]
+        return max(foreign, key=lambda item: item.value) if foreign else None
 
 
 def _normalize_currency(token: str) -> str:
@@ -169,31 +213,106 @@ def _find_known(text: str, catalogue: dict[str, tuple[str, ...]]) -> list[str]:
     ]
 
 
-def extract_party_mentions(text: str) -> list[PartyMention]:
-    names: list[str] = []
-    for match in _RU_ORG.finditer(text):
-        names.append(" ".join(match.group(0).split()))
-    for match in _EN_ORG.finditer(text):
-        names.append(" ".join(match.group(0).split()))
+# Слово рядом с наименованием → роль лица в договоре.
+_ROLE_MARKERS: tuple[tuple[str, str], ...] = (
+    ("депозитар", "цифровой депозитарий"),
+    ("эмитент", "эмитент цифровой валюты"),
+    ("уполномоченн", "уполномоченный банк"),
+    ("банк", "банк"),
+    ("покупател", "покупатель"),
+    ("поставщик", "поставщик"),
+    ("продав", "продавец"),
+    ("заказчик", "заказчик"),
+    ("исполнител", "исполнитель"),
+    ("перевозчик", "перевозчик"),
+    ("агент", "агент"),
+    ("комиссионер", "комиссионер"),
+)
 
-    inns = [match.group(1) for match in _INN.finditer(text)]
-    parties: list[PartyMention] = []
+
+def _role_in(segment: str) -> str | None:
+    lowered = segment.lower()
+    best: tuple[int, str] | None = None
+    for marker, role in _ROLE_MARKERS:
+        position = lowered.find(marker)
+        if position < 0:
+            continue
+        if best is None or position < best[0]:
+            best = (position, role)
+    return best[1] if best else None
+
+
+def _role_near(before: str, after: str) -> str | None:
+    """Роль ищется сначала после наименования, потом перед ним.
+
+    В договорах пишут «…, именуемое в дальнейшем «Поставщик»», то есть роль
+    стоит справа. Маркер слева чаще принадлежит предыдущей стороне: в шапке
+    «…именуемое «Покупатель», и Berlin Machinen GmbH…» немецкий поставщик
+    получал роль покупателя.
+    """
+    return _role_in(after) or _role_in(before)
+
+
+def extract_party_mentions(text: str) -> list[PartyMention]:
+    """Организации, названные в договоре, с ИНН и ролью, если они рядом.
+
+    ИНН привязывается к ближайшему наименованию слева и только к одному.
+    Раньше окно поиска захватывало по 80 знаков в обе стороны, и в типовой
+    шапке «ООО «Х», ИНН …, и компанией Y Co., Ltd» один и тот же ИНН
+    привязывался к обеим сторонам. Вторая сторона потом пропадала при
+    склейке по ИНН — из проверки контрагента исчезал иностранный поставщик,
+    ради которого она и нужна.
+    """
+    spans: list[tuple[int, str]] = []
+    for pattern in (_RU_ORG, _EN_ORG):
+        for match in pattern.finditer(text):
+            spans.append((match.start(), " ".join(match.group(0).split())))
+    spans.sort()
+
+    # Одинаковые наименования схлопываем, оставляя первое вхождение.
+    unique: list[tuple[int, str]] = []
+    seen_names: set[str] = set()
+    for start, name in spans:
+        if name in seen_names:
+            continue
+        seen_names.add(name)
+        unique.append((start, name))
+
+    inn_at = [(match.start(1), match.group(1)) for match in _INN.finditer(text)]
+    taken_names: dict[int, str] = {}
     used_inns: set[str] = set()
 
-    for name in names:
-        linked: str | None = None
-        pos = text.find(name)
-        window = text[max(0, pos - 80) : pos + len(name) + 120] if pos >= 0 else ""
-        for inn in inns:
-            if inn in window:
-                linked = inn
-                used_inns.add(inn)
-                break
-        parties.append(PartyMention(name=name, inn=linked))
+    for inn_pos, inn in inn_at:
+        if inn in used_inns:
+            continue
+        # Ближайшее наименование слева, не дальше 150 знаков.
+        candidates = [
+            (inn_pos - start, start)
+            for start, name in unique
+            if start < inn_pos and inn_pos - (start + len(name)) <= 150
+        ]
+        candidates = [item for item in candidates if item[1] not in taken_names]
+        if not candidates:
+            continue
+        _distance, start = min(candidates)
+        taken_names[start] = inn
+        used_inns.add(inn)
 
-    for inn in inns:
+    parties: list[PartyMention] = []
+    for start, name in unique:
+        end = start + len(name)
+        parties.append(
+            PartyMention(
+                name=name,
+                inn=taken_names.get(start),
+                role=_role_near(text[max(0, start - 60) : start], text[end : end + 120]),
+            )
+        )
+
+    for _position, inn in inn_at:
         if inn not in used_inns:
             parties.append(PartyMention(name="", inn=inn))
+            used_inns.add(inn)
     return parties
 
 

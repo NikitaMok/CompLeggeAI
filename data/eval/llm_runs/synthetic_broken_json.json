@@ -1,0 +1,11 @@
+{
+  "model": "synthetic_broken_json",
+  "synthetic": true,
+  "note": "Синтетическая запись для самопроверки приёмочного прогона. Это не измерение настоящей модели.",
+  "answers": {
+    "compliant#0": "{\"notes\": [ {\"code\": \"FTC-004\",",
+    "violating#0": "{\"notes\": [ {\"code\": \"FTC-004\",",
+    "long_annexes#0": "{\"notes\": [ {\"code\": \"FTC-004\",",
+    "long_annexes#1": "{\"notes\": [ {\"code\": \"FTC-004\","
+  }
+}

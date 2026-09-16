@@ -435,9 +435,10 @@ def party_details_present(contract: ContractView) -> Outcome:
 
 @register("party_details_above_travel_rule_threshold")
 def party_details_above_travel_rule_threshold(contract: ContractView) -> Outcome:
+    gate = _threshold_gate(contract, "60 000 руб.")
+    if gate is not None:
+        return gate
     amount = contract.contract_amount()
-    if amount is None:
-        return _skip("сумма договора из текста не определена")
     if amount <= TRAVEL_RULE_THRESHOLD:
         return _skip(f"сумма {_amount(amount)} не превышает порог 60 000 руб.")
 
@@ -455,14 +456,41 @@ def details_update_obligation(contract: ContractView) -> Outcome:
     )
 
 
+def _money(amount) -> str:
+    """Сумма в иностранной валюте: «300 000 USD»."""
+    value = f"{amount.value:,.0f}".replace(",", "\u00a0")
+    return f"{value} {amount.currency}"
+
+
+def _threshold_gate(contract: ContractView, threshold_name: str) -> Outcome | None:
+    """Что делать пороговому правилу, когда рублёвой суммы в тексте нет.
+
+    Договор ВЭД обычно номинирован в валюте. Раньше такое правило отвечало
+    «сумма из текста не определена» и уходило в «не применимо», а юрист читал
+    это как «порог не достигнут». Теперь правило называет валютную сумму
+    и отправляет вопрос на оценку: пересчёт по курсу — не дело программы.
+    """
+    if contract.contract_amount() is not None:
+        return None
+    foreign = contract.foreign_contract_amount()
+    if foreign is None:
+        return _skip("сумма договора из текста не определена")
+    return _unresolved(
+        f"сумма договора выражена в иностранной валюте ({_money(foreign)}); "
+        f"порог {threshold_name} применяется к рублёвому эквиваленту — "
+        "оценить по курсу на дату платежа"
+    )
+
+
 # --- F. Пороги и контроль ---
 
 
 @register("mandatory_control_readiness")
 def mandatory_control_readiness(contract: ContractView) -> Outcome:
+    gate = _threshold_gate(contract, "обязательного контроля 10 млн руб.")
+    if gate is not None:
+        return gate
     amount = contract.contract_amount()
-    if amount is None:
-        return _skip("сумма договора из текста не определена")
     if amount < MANDATORY_CONTROL_THRESHOLD:
         return _skip(f"сумма {_amount(amount)} ниже порога обязательного контроля")
 
@@ -481,9 +509,10 @@ def mandatory_control_readiness(contract: ContractView) -> Outcome:
 
 @register("bank_registration_clause")
 def bank_registration_clause(contract: ContractView) -> Outcome:
+    gate = _threshold_gate(contract, "постановки на учёт 3 млн руб.")
+    if gate is not None:
+        return gate
     amount = contract.contract_amount()
-    if amount is None:
-        return _skip("сумма договора из текста не определена")
     if amount < BANK_REGISTRATION_THRESHOLD:
         return _skip(
             f"сумма {_amount(amount)} ниже порога постановки на учёт "
@@ -503,32 +532,69 @@ def bank_registration_clause(contract: ContractView) -> Outcome:
     )
 
 
+# Доля порога, ниже которой транш уже нельзя назвать «чуть ниже границы».
+# Транш в 2,9 млн при пороге 3 млн — признак; транш в 200 тыс. — обычный график.
+_SPLIT_NEAR = Decimal("0.75")
+
+
 @register("no_payment_splitting")
 def no_payment_splitting(contract: ContractView) -> Outcome:
+    """Искусственное дробление платежей под порог.
+
+    Считаются именно платежи, а не различные суммы: четыре транша по 2,9 млн
+    при пороге 3 млн — классическая схема, и раньше она проходила мимо
+    правила, потому что сумма транша одна и та же.
+
+    Пороги проверяются от меньшего к большему: транш, подогнанный под 3 млн,
+    говорит больше, чем факт «сумма ниже 10 млн».
+    """
     amount = contract.contract_amount()
-    rub = [item.value for item in contract.facts.amounts if item.currency == "RUB"]
-    unique = sorted(set(rub))
+    payments = [
+        item.value
+        for item in contract.facts.amounts
+        if item.currency == "RUB" and (amount is None or item.value != amount)
+    ]
     has_schedule = contract.has_any(
         r"транш", r"поэтапн", r"график\s+платеж", r"платеж\w*\s+частями", r"частями"
     )
 
-    threshold: Decimal | None = None
-    if amount is not None and amount >= MANDATORY_CONTROL_THRESHOLD:
-        threshold = MANDATORY_CONTROL_THRESHOLD
-    elif amount is not None and amount >= BANK_REGISTRATION_THRESHOLD:
-        threshold = BANK_REGISTRATION_THRESHOLD
+    if amount is None:
+        foreign = contract.foreign_contract_amount()
+        if foreign is not None:
+            return _unresolved(
+                f"сумма договора выражена в иностранной валюте ({_money(foreign)}); "
+                "пороги установлены в рублёвом эквиваленте — оценить график "
+                "платежей по курсу на дату платежа"
+            )
+        if has_schedule:
+            return _unresolved(
+                "в договоре указан график платежей, но общая сумма из текста "
+                "не определяется: вывод о дроблении сделать нельзя"
+            )
+        return _passed("признаков искусственного дробления платежей в тексте не видно")
 
-    below = [value for value in unique if threshold is not None and value < threshold]
-    if threshold is not None and len(below) >= 2:
-        return _failed(
-            f"в договоре несколько сумм ниже порога {_amount(threshold)} "
-            f"при общей сумме {_amount(amount)}"
-        )
+    for threshold in (BANK_REGISTRATION_THRESHOLD, MANDATORY_CONTROL_THRESHOLD):
+        if amount < threshold:
+            continue
+        below = [value for value in payments if value < threshold]
+        near = [value for value in below if value >= threshold * _SPLIT_NEAR]
+        if len(near) >= 2:
+            largest = max(near)
+            return _failed(
+                f"платежей ниже порога {_amount(threshold)}: {len(near)}, "
+                f"наибольший — {_amount(largest)} при общей сумме {_amount(amount)}"
+            )
+        if len(below) >= 2 and len({value for value in below}) >= 2:
+            return _unresolved(
+                f"в договоре несколько платежей ниже порога {_amount(threshold)} "
+                f"при общей сумме {_amount(amount)}: оценить, не является ли "
+                "график дроблением"
+            )
 
-    if has_schedule and amount is not None and amount >= BANK_REGISTRATION_THRESHOLD:
+    if has_schedule:
         return _unresolved(
-            "в договоре указан график или оплата частями; по суммам траншей "
-            "вывод сделать нельзя"
+            "в договоре указан график или оплата частями; суммы траншей "
+            "из текста не выделены, вывод о дроблении сделать нельзя"
         )
 
     return _passed("признаков искусственного дробления платежей в тексте не видно")

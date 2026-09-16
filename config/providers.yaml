@@ -1,18 +1,49 @@
-# Источники проверки. Этот файл — то, что работает «как скачали».
+# Каталог источников. Этот файл — то, что работает «как скачали».
 # Ключи в git не пишутся: они лежат в `.env` (см. `.env.example`).
 #
-# Бесплатный режим: все записи с tier: free и enabled: true.
-# Свои платные сервисы: включить запись с tier: paid и прописать ключ в `.env`.
-# Сменить модель: проще всего OLLAMA_MODEL в `.env` — он перекрывает поле llm.model.
+# tier:
+#   free        — работает без ключа;
+#   free + required_key: true — ключ бесплатный, но обязателен;
+#   paid        — ключ клиента обязателен, доступ платный;
+#   self_hosted — сервис поднимается рядом, ключ не нужен, нужен адрес.
+#
+# Запись, к которой в проекте нет коннектора, честно называется
+# нереализованной в заключении: см. app/core/provider.py.
+# Что каждый источник даёт и где взять ключ — README.md, раздел
+# «Быстрый старт».
 
 llm:
   provider: ollama
-  # Класс 70B. Легковесные и средние модели для разбора договора не ставить.
+  # Опорная модель, относительно которой написана документация.
+  # Пригодность другой модели проверяется прогоном, а не размером:
+  #   python -m scripts.eval_llm --model <имя>
   model: llama3.3:70b
   base_url: http://127.0.0.1:11434
 
 wallet:
-  # --- бесплатные, включены сразу ---
+  # --- коммерческий скоринг адреса: ключ клиента ---
+  - id: amlbot
+    enabled: true
+    tier: paid
+    what: "скоринг адреса и источников средств (KYT), TRON и USDT в фокусе"
+    base_url: https://extrnl.amlbot.com
+    env_key: AMLBOT_API_KEY
+
+  - id: misttrack
+    enabled: true
+    tier: paid
+    what: "скоринг адреса и метки по категориям риска"
+    base_url: https://openapi.misttrack.io
+    env_key: MISTTRACK_API_KEY
+
+  - id: chainalysis
+    enabled: true
+    tier: paid
+    what: "корпоративный KYT: связь адреса с нелегальным оборотом"
+    base_url: https://api.chainalysis.com
+    env_key: CHAINALYSIS_API_KEY
+
+  # --- факты по цепочке: возраст, обороты, баланс. Не скоринг ---
   - id: trongrid
     enabled: true
     tier: free
@@ -24,6 +55,7 @@ wallet:
   - id: etherscan
     enabled: true
     tier: free
+    required_key: true
     what: "возраст и активность адреса в Ethereum (ERC-20)"
     base_url: https://api.etherscan.io
     # бесплатный ключ с etherscan.io; без него ERC-20 не опрашивается
@@ -32,37 +64,46 @@ wallet:
   - id: goplus
     enabled: true
     tier: free
-    what: "публичные метки риска адреса (фишинг, мошенничество, известные инциденты)"
+    what: "публичные метки риска адреса (фишинг, мошенничество, инциденты)"
     base_url: https://api.gopluslabs.io
 
-  # --- платные, выключены. Включить: enabled: true и ключ в `.env` ---
-  - id: chainalysis
-    enabled: false
-    tier: paid
-    what: "коммерческий KYT / связь с нелегальным оборотом"
-    env_key: CHAINALYSIS_API_KEY
-    module: app.aml.providers
-
+  # --- коннектора нет: включать бессмысленно, отчёт скажет об этом прямо ---
   - id: elliptic
     enabled: false
     tier: paid
     what: "коммерческий скоринг адреса"
     env_key: ELLIPTIC_API_KEY
-    module: app.aml.providers
 
   - id: bitok
     enabled: false
     tier: paid
     what: "российский коммерческий скоринг криптоадресов"
     env_key: BITOK_API_KEY
-    module: app.aml.providers
 
 counterparty:
-  # --- бесплатные, включены сразу ---
+  # --- российское юрлицо: официальные данные ФНС через DaData ---
+  - id: dadata
+    enabled: true
+    tier: free
+    required_key: true
+    what: "карточка ЕГРЮЛ: статус, ликвидация, руководитель, ОКВЭД, адрес"
+    base_url: https://suggestions.dadata.ru
+    # бесплатный ключ на dadata.ru, 10 000 запросов в сутки
+    env_key: DADATA_API_KEY
+
+  # --- российское юрлицо: расширенная проверка по ключу клиента ---
+  - id: kontur_focus
+    enabled: true
+    tier: paid
+    what: "Контур.Фокус: статус, признаки недостоверности, 115-ФЗ, аффилированность"
+    base_url: https://focus-api.kontur.ru
+    env_key: KONTUR_FOCUS_KEY
+
+  # --- запасные бесплатные источники: работают, пока нет ключей ---
   - id: egrul
     enabled: true
     tier: free
-    what: "карточка российской организации в ЕГРЮЛ (ФНС): статус, ликвидация, наименование"
+    what: "карточка организации в ЕГРЮЛ (ФНС) напрямую"
     base_url: https://egrul.nalog.gov.ru
 
   - id: rusprofile
@@ -77,11 +118,14 @@ counterparty:
     what: "открытые сведения о контрагенте на saby.ru (СБИС)"
     base_url: https://saby.ru
 
+  # --- иностранная сторона ---
   - id: opencorporates
     enabled: true
     tier: free
-    what: "открытые карточки иностранных компаний (OpenCorporates), без ключа с лимитом"
+    required_key: true
+    what: "открытые карточки иностранных компаний (OpenCorporates)"
     base_url: https://api.opencorporates.com
+    # Токен обязателен: анонимный запрос к v0.4 отвечает 401 (проверено 15.09.2026).
     env_key: OPENCORPORATES_API_TOKEN
 
   - id: gleif
@@ -90,24 +134,27 @@ counterparty:
     what: "поиск иностранной компании по реестру LEI (GLEIF), без ключа"
     base_url: https://api.gleif.org
 
-  # --- платные, выключены ---
-  - id: kontur_focus
-    enabled: false
-    tier: paid
-    what: "Контур.Фокус: расширенная карточка, связи, признаки недостоверности"
-    env_key: KONTUR_FOCUS_KEY
-    module: app.counterparty.providers
-
+  # --- коннектора нет ---
   - id: spark
     enabled: false
     tier: paid
     what: "СПАРК-Интерфакс"
     env_key: SPARK_API_KEY
-    module: app.counterparty.providers
 
   - id: sbis_api
     enabled: false
     tier: paid
     what: "официальный API СБИС по договору, не публичная страница"
     env_key: SBIS_API_KEY
-    module: app.counterparty.providers
+
+sanctions:
+  # Санкционный и PEP-скрининг. Опорный режим — свой сервер yente рядом
+  # с сервисом: наименования контрагентов не уходят даже в OpenSanctions.
+  # Облачный API включается тем же ключом и адресом.
+  - id: opensanctions
+    enabled: true
+    tier: self_hosted
+    what: "санкционные списки и PEP, сопоставление сущностей (OpenSanctions)"
+    base_url: http://127.0.0.1:8001
+    # пусто для своего yente; для облачного API — ключ OpenSanctions
+    env_key: OPENSANCTIONS_API_KEY

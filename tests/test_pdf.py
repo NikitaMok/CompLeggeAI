@@ -32,11 +32,16 @@ class TestPdfContent:
         assert "КРАСНЫЙ" in text
         assert "[ADR-001]" in text
         assert "2.3" in text
-        assert "юридическая консультация" in text
+        # Правовая оговорка стоит первой и названа своими словами.
+        assert "Правовой статус документа" in text
+        assert "юридической консультацией" in text
         assert "цифровым анализом" in text
-        assert "1. Договор" in text
-        assert "2. Кошелёк" in text
-        assert "3. Контрагент" in text
+        assert "Ответственность за такие решения" in text
+        assert "Блок 1. Договор" in text
+        assert "Блок 2. Адрес расчёта" in text
+        assert "Блок 3. Стороны" in text
+        # Оговорка идёт раньше выводов, а не после них.
+        assert text.index("Правовой статус документа") < text.index("Блок 1. Договор")
 
     def test_cli_writes_pdf(self, compliant_docx: Path, tmp_path, capsys, cyrillic_font):
         output = tmp_path / "заключение.pdf"
